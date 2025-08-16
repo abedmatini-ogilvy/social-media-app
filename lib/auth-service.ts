@@ -1,143 +1,166 @@
 /**
  * Authentication Service for CivicConnect
- * Handles user authentication, token management, and session persistence
+ * Handles user authentication with Supabase integration
  */
 
-import { apiRequest, API_ENDPOINTS } from "./api-service"
+import { supabase } from './supabase'
+import { ProfileService, UserProfile, UserRole } from './profile-service'
+import type { User } from '@supabase/supabase-js'
 
-// Types
-export interface User {
-  id: string
-  name: string
-  email: string
-  avatar?: string
-  role: "citizen" | "official"
-  isVerified: boolean
-  createdAt: string
+// Enhanced User type that includes profile data
+export interface AuthUser extends User {
+  profile?: UserProfile | null
 }
 
-export interface AuthResponse {
-  token: string
-  refreshToken: string
-  user: User
-}
-
-// Token storage keys
-const TOKEN_KEY = "civicconnect_token"
-const REFRESH_TOKEN_KEY = "civicconnect_refresh_token"
-const USER_KEY = "civicconnect_user"
-
-// Store authentication data in localStorage (or sessionStorage)
-export const storeAuthData = (authData: AuthResponse) => {
-  if (typeof window === "undefined") return
-
-  localStorage.setItem(TOKEN_KEY, authData.token)
-  localStorage.setItem(REFRESH_TOKEN_KEY, authData.refreshToken)
-  localStorage.setItem(USER_KEY, JSON.stringify(authData.user))
-}
-
-// Clear authentication data from storage
-export const clearAuthData = () => {
-  if (typeof window === "undefined") return
-
-  localStorage.removeItem(TOKEN_KEY)
-  localStorage.removeItem(REFRESH_TOKEN_KEY)
-  localStorage.removeItem(USER_KEY)
-}
-
-// Get stored token
-export const getToken = (): string | null => {
-  if (typeof window === "undefined") return null
-  return localStorage.getItem(TOKEN_KEY)
-}
-
-// Get stored refresh token
-export const getRefreshToken = (): string | null => {
-  if (typeof window === "undefined") return null
-  return localStorage.getItem(REFRESH_TOKEN_KEY)
-}
-
-// Get stored user data
-export const getUser = (): User | null => {
-  if (typeof window === "undefined") return null
-
-  const userData = localStorage.getItem(USER_KEY)
-  if (!userData) return null
-
-  try {
-    return JSON.parse(userData) as User
-  } catch (error) {
-    console.error("Failed to parse user data:", error)
-    return null
-  }
-}
-
-// Check if user is authenticated
-export const isAuthenticated = (): boolean => {
-  return !!getToken()
-}
-
-// Login user
-export const loginUser = async (email: string, password: string): Promise<AuthResponse> => {
-  const response = await apiRequest<AuthResponse>(API_ENDPOINTS.AUTH.LOGIN, "POST", { email, password })
-
-  storeAuthData(response)
-  return response
-}
-
-// Register user
-export const registerUser = async (userData: {
-  name: string
+export interface SignUpData {
   email: string
   password: string
-  role: "citizen" | "official"
-}): Promise<AuthResponse> => {
-  const response = await apiRequest<AuthResponse>(API_ENDPOINTS.AUTH.REGISTER, "POST", userData)
-
-  storeAuthData(response)
-  return response
+  full_name?: string
+  role?: UserRole
 }
 
-// Logout user
-export const logoutUser = async (): Promise<void> => {
-  const token = getToken()
+export interface SignInData {
+  email: string
+  password: string
+}
 
-  if (token) {
+export class AuthService {
+  // Sign up with profile creation
+  static async signUp(data: SignUpData) {
     try {
-      await apiRequest(API_ENDPOINTS.AUTH.LOGOUT, "POST", undefined, token)
+      const { data: authData, error } = await supabase.auth.signUp({
+        email: data.email,
+        password: data.password,
+        options: {
+          data: {
+            full_name: data.full_name || '',
+            role: data.role || 'citizen'
+          }
+        }
+      })
+
+      if (error) {
+        throw error
+      }
+
+      // Profile will be created automatically by the database trigger
+      // No need to manually update here
+      return { data: authData, error: null }
     } catch (error) {
-      console.error("Logout failed:", error)
+      console.error('Sign up error:', error)
+      return { data: null, error }
     }
   }
 
-  clearAuthData()
-}
+  // Sign in
+  static async signIn(data: SignInData) {
+    try {
+      const { data: authData, error } = await supabase.auth.signInWithPassword({
+        email: data.email,
+        password: data.password,
+      })
 
-// Refresh token
-export const refreshAuthToken = async (): Promise<AuthResponse> => {
-  const refreshToken = getRefreshToken()
+      if (error) {
+        throw error
+      }
 
-  if (!refreshToken) {
-    throw new Error("No refresh token available")
+      return { data: authData, error: null }
+    } catch (error) {
+      console.error('Sign in error:', error)
+      return { data: null, error }
+    }
   }
 
-  const response = await apiRequest<AuthResponse>(API_ENDPOINTS.AUTH.REFRESH_TOKEN, "POST", { refreshToken })
+  // Sign out
+  static async signOut() {
+    try {
+      const { error } = await supabase.auth.signOut()
+      
+      if (error) {
+        throw error
+      }
 
-  storeAuthData(response)
-  return response
+      return { error: null }
+    } catch (error) {
+      console.error('Sign out error:', error)
+      return { error }
+    }
+  }
+
+  // Get current user with profile
+  static async getCurrentUser(): Promise<AuthUser | null> {
+    try {
+      const { data: { user }, error } = await supabase.auth.getUser()
+      
+      if (error || !user) {
+        return null
+      }
+
+      // Get user profile
+      const profile = await ProfileService.getCurrentUserProfile()
+      
+      return {
+        ...user,
+        profile
+      }
+    } catch (error) {
+      console.error('Error getting current user:', error)
+      return null
+    }
+  }
+
+  // Get current session
+  static async getSession() {
+    try {
+      const { data: { session }, error } = await supabase.auth.getSession()
+      
+      if (error) {
+        throw error
+      }
+
+      return session
+    } catch (error) {
+      console.error('Error getting session:', error)
+      return null
+    }
+  }
+
+  // Listen to auth state changes
+  static onAuthStateChange(callback: (user: AuthUser | null) => void) {
+    return supabase.auth.onAuthStateChange(async (event, session) => {
+      if (session?.user) {
+        const profile = await ProfileService.getCurrentUserProfile()
+        callback({
+          ...session.user,
+          profile
+        })
+      } else {
+        callback(null)
+      }
+    })
+  }
+
+  // Check if user is authenticated
+  static async isAuthenticated(): Promise<boolean> {
+    const session = await this.getSession()
+    return !!session?.user
+  }
+
+  // Get access token for API requests
+  static async getAccessToken(): Promise<string | null> {
+    const session = await this.getSession()
+    return session?.access_token || null
+  }
 }
 
-// Request password reset
-export const requestPasswordReset = async (email: string): Promise<{ message: string }> => {
-  return apiRequest<{ message: string }>(API_ENDPOINTS.AUTH.FORGOT_PASSWORD, "POST", { email })
-}
-
-// Reset password
-export const resetPassword = async (token: string, newPassword: string): Promise<{ message: string }> => {
-  return apiRequest<{ message: string }>(API_ENDPOINTS.AUTH.RESET_PASSWORD, "POST", { token, newPassword })
-}
-
-// Verify email
-export const verifyEmail = async (token: string): Promise<{ message: string }> => {
-  return apiRequest<{ message: string }>(API_ENDPOINTS.AUTH.VERIFY_EMAIL, "POST", { token })
-}
+// Export convenience functions
+export const {
+  signUp,
+  signIn,
+  signOut,
+  getCurrentUser,
+  getSession,
+  onAuthStateChange,
+  isAuthenticated,
+  getAccessToken
+} = AuthService
